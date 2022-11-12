@@ -5,12 +5,19 @@ import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js'
+import { directionManager } from './animationManger/DirectionManager.js'
+import { AnimationManager} from './animationManger/AnimationManager.js'
+import { Octree } from 'three/addons/math/Octree.js';
+import { Capsule } from 'three/addons/math/Capsule.js';
+
+
 
 class CombiningLoad {
 
     constructor() {
         this._setCamera();
         this._setScene();
+        this._setOctree();
         this._setGround();
         this._setLight();
         this._setLoader();
@@ -52,6 +59,14 @@ class CombiningLoad {
         // URL.revokeObjectURL( url ); breaks Firefox...
     }
 
+    _setOctree() {
+        this._octree = new Octree();
+    }
+
+    _addInOctree(object) {
+        this._octree.fromGraphNode(object);
+    }
+
 
     _saveString( text, filename ) {
         this._save( new Blob( [ text ], { type: 'text/plain' } ), filename );
@@ -74,7 +89,15 @@ class CombiningLoad {
 
     _setCamera() {
         this._camera = new THREE.PerspectiveCamera( 45, window.innerWidth / window.innerHeight, 1, 2000 );
-        this._camera.position.set(0, 200, 300);
+        this._camera.position.set(0, 200, -400);
+    }
+
+    getCameraDirection() {
+        const cameraDirection = new THREE.Vector3();
+        this._camera.getWorldDirection(cameraDirection);
+        cameraDirection.y = 0;
+        cameraDirection.normalize();
+        return cameraDirection;
     }
 
     _setScene() {
@@ -94,6 +117,9 @@ class CombiningLoad {
         grid.material.transparent = true;
         grid.receiveShadow = true;
         this._scene.add( grid );
+
+        this._addInOctree(mesh);
+        this._addInOctree(grid);
     }
 
     _setLight() {
@@ -136,11 +162,8 @@ class CombiningLoad {
             this._scene.add(object);
             
             this._mixer = new THREE.AnimationMixer(object);
-            this._setAnimation();
-            this._setGUI();
-            this._extractAnimation(object);
-            this._animation['animation'].play();
-            
+            this._animationManager = new AnimationManager(this._mixer);
+            this._setCapsuleForModel(object);
             object.traverse(child => {
                 if (child instanceof THREE.Mesh) {
                     child.castShadow = true;
@@ -152,40 +175,18 @@ class CombiningLoad {
             });
         });
     }
-    
-    _setAnimation() {
-        this._animation = {
-            previous: null,
-            animation: null
-        };
-        this._animationDict = [];
-        this._listDict = {}
-    }
 
-    _setGUI() {
-        this._gui = new GUI( {width : 300} );
-    }
+    _setCapsuleForModel(object) {
+        const box = (new THREE.Box3).setFromObject(object);
+        const height = box.max.y - box.min.y;
+        const diameter = box.max.z - box.min.z;
 
-    _refreshGUI() {
-        this._gui.destroy();
-        this._setGUI()
-        if (this._animation['previous']) this._animation['previous'].fadeOut();
-        this._animation['animation'] = this._animation['previous'] = this._animationDict[0]
-        this._animationDict[0].reset().fadeIn(0.5).play();
-        this._animationDict.forEach((value, index) => {
-            this._listDict[`animation : ${index}`] = value;
-        })
-        this._animationList = this._gui.add(this._animation, 'animation', this._listDict).onChange(this._changeAnimation.bind(this));
+        object._capsule = new Capsule(
+            new THREE.Vector3(0, diameter/2, 0),
+            new THREE.Vector3(0, height - diameter/2, 0),
+            diameter/2
+        );
     }
-
-    _changeAnimation() {
-        if (this._animation['previous'] !== this._animation['animation']) {
-            this._animation['previous'].fadeOut(0.5);
-            this._animation['animation'].reset().fadeIn(0.5).play();
-            this._animation['previous'] = this._animation['animation'];
-        }  
-    }
-
     
     _setRenderer() {
         this._renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -219,10 +220,82 @@ class CombiningLoad {
         requestAnimationFrame(this._animate.bind(this));
         const delta = this._clock.getDelta();
         this._renderer.render(this._scene, this._camera);
-        if (this._mixer) {
+        if (this._mixer && this._animationManager) {
             this._mixer.update(delta);
+            directionManager.applyFallAccelerate();
+            this._collisionSetting();
+            this._followCapsule();
+            this._rotateModel();
+            this._animationManager.changeAnimation(directionManager.getOriginalDirection());
         }
     }
+
+
+
+    _rotateModel() {
+        const angleCameraDirectionAxisY = Math.atan2(
+            this._camera.position.x - this._model.position.x,
+            this._camera.position.z - this._model.position.z
+        ) + Math.PI;
+
+        const rotateQuaternion = new THREE.Quaternion();
+        rotateQuaternion.setFromAxisAngle(
+            new THREE.Vector3(0,1,0),
+            angleCameraDirectionAxisY
+        );
+
+        this._model.quaternion.rotateTowards(rotateQuaternion, THREE.MathUtils.degToRad(10));
+
+    }
+
+    _movingModelAndCamera() {
+        const velocity = directionManager.getVelocity();
+        this._model.position.set(
+            this._model.position.x + velocity.x,
+            this._model.position.y + velocity.y,
+            this._model.position.z + velocity.z
+        );
+        this._camera.position.set(
+            this._camera.position.x + velocity.x,
+            this._camera.position.y + velocity.y,
+            this._camera.position.z + velocity.z,
+        );
+
+        this._controls.target.set(this._model.position.x, this._model.position.y + 100, this._model.position.z);
+    }
+
+    _collisionSetting() {
+        const velocity = directionManager.getVelocity();
+        this._model._capsule.translate(velocity);
+        
+        const result = this._octree.capsuleIntersect(this._model._capsule);
+        if (result) {
+            this._model._capsule.translate(result.normal.multiplyScalar(result.depth));
+            directionManager.stopFalling();
+            directionManager.setFalltime();
+            directionManager.setModelCanJump();
+        }
+    }
+
+
+    _followCapsule() {
+        const previousPosition = this._model.position.clone();
+        this._model.position.set(
+            this._model._capsule.start.x,
+            this._model._capsule.start.y - this._model._capsule.radius,
+            this._model._capsule.start.z
+        );
+
+        this._camera.position.set(
+            this._camera.position.x + this._model.position.x - previousPosition.x,
+            this._camera.position.y + this._model.position.y - previousPosition.y,
+            this._camera.position.z + this._model.position.z - previousPosition.z
+        )
+
+        this._controls.target.set(this._model.position.x, this._model.position.y + 100, this._model.position.z);
+    }
+
+
 
     _removeFromViewerAndAddCharacter(url) {
         if (this._character) this._scene.remove(this._character);
